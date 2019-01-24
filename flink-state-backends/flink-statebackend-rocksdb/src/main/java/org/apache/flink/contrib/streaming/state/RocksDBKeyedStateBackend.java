@@ -58,6 +58,7 @@ import org.apache.flink.runtime.state.KeyExtractorFunction;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupedInternalPriorityQueue;
 import org.apache.flink.runtime.state.KeyGroupsStateHandle;
+import org.apache.flink.runtime.state.KeyScope;
 import org.apache.flink.runtime.state.Keyed;
 import org.apache.flink.runtime.state.KeyedBackendSerializationProxy;
 import org.apache.flink.runtime.state.KeyedStateHandle;
@@ -258,8 +259,36 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 		MetricGroup metricGroup
 	) throws IOException {
 
+		this(operatorIdentifier, userCodeClassLoader, instanceBasePath,
+			dbOptions, columnFamilyOptions, kvStateRegistry, keySerializer,
+			numberOfKeyGroups, keyGroupRange, executionConfig, enableIncrementalCheckpointing,
+			localRecoveryConfig, priorityQueueStateType, ttlTimeProvider,
+			metricOptions, metricGroup, KeyScope.GLOBAL);
+
+	}
+
+	public RocksDBKeyedStateBackend(
+		String operatorIdentifier,
+		ClassLoader userCodeClassLoader,
+		File instanceBasePath,
+		DBOptions dbOptions,
+		ColumnFamilyOptions columnFamilyOptions,
+		TaskKvStateRegistry kvStateRegistry,
+		TypeSerializer<K> keySerializer,
+		int numberOfKeyGroups,
+		KeyGroupRange keyGroupRange,
+		ExecutionConfig executionConfig,
+		boolean enableIncrementalCheckpointing,
+		LocalRecoveryConfig localRecoveryConfig,
+		RocksDBStateBackend.PriorityQueueStateType priorityQueueStateType,
+		TtlTimeProvider ttlTimeProvider,
+		RocksDBNativeMetricOptions metricOptions,
+		MetricGroup metricGroup,
+		KeyScope keyScope
+	) throws IOException {
+
 		super(kvStateRegistry, keySerializer, userCodeClassLoader,
-			numberOfKeyGroups, keyGroupRange, executionConfig, ttlTimeProvider);
+			numberOfKeyGroups, keyGroupRange, executionConfig, ttlTimeProvider, keyScope);
 
 		this.operatorIdentifier = Preconditions.checkNotNull(operatorIdentifier);
 
@@ -532,6 +561,7 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 				db,
 				rocksDBResourceGuard,
 				keySerializer,
+				keyScope,
 				kvStateInformation,
 				keyGroupRange,
 				keyGroupPrefixBytes,
@@ -559,6 +589,7 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 				db,
 				rocksDBResourceGuard,
 				keySerializer,
+				keyScope,
 				kvStateInformation,
 				keyGroupRange,
 				keyGroupPrefixBytes,

@@ -71,6 +71,7 @@ import org.apache.flink.runtime.state.CheckpointStorage;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
 import org.apache.flink.runtime.state.DoneFuture;
 import org.apache.flink.runtime.state.KeyGroupStatePartitionStreamProvider;
+import org.apache.flink.runtime.state.KeyScope;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.OperatorStateBackend;
 import org.apache.flink.runtime.state.OperatorStateHandle;
@@ -209,6 +210,7 @@ public class StreamTaskTest extends TestLogger {
 
 		StreamConfig cfg = new StreamConfig(new Configuration());
 		cfg.setStateKeySerializer(mock(TypeSerializer.class));
+		cfg.setStateKeyScope(KeyScope.GLOBAL);
 		cfg.setOperatorID(new OperatorID(4711L, 42L));
 		TestStreamSource<Long, MockSourceFunction> streamSource = new TestStreamSource<>(new MockSourceFunction());
 		cfg.setStreamOperator(streamSource);
@@ -241,6 +243,7 @@ public class StreamTaskTest extends TestLogger {
 
 		StreamConfig cfg = new StreamConfig(new Configuration());
 		cfg.setStateKeySerializer(mock(TypeSerializer.class));
+		cfg.setStateKeyScope(KeyScope.GLOBAL);
 		cfg.setOperatorID(new OperatorID(4711L, 42L));
 		TestStreamSource<Long, MockSourceFunction> streamSource = new TestStreamSource<>(new MockSourceFunction());
 		cfg.setStreamOperator(streamSource);
@@ -1074,13 +1077,14 @@ public class StreamTaskTest extends TestLogger {
 		@Override
 		public StreamTaskStateInitializer createStreamTaskStateInitializer() {
 			final StreamTaskStateInitializer streamTaskStateManager = super.createStreamTaskStateInitializer();
-			return (operatorID, operatorClassName, keyContext, keySerializer, closeableRegistry, metricGroup) -> {
+			return (operatorID, operatorClassName, keyContext, keySerializer, keyScope, closeableRegistry, metricGroup) -> {
 
 				final StreamOperatorStateContext context = streamTaskStateManager.streamOperatorStateContext(
 					operatorID,
 					operatorClassName,
 					keyContext,
 					keySerializer,
+					keyScope,
 					closeableRegistry,
 					metricGroup);
 
