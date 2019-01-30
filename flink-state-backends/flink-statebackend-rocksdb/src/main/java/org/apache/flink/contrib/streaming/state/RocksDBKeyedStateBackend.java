@@ -112,6 +112,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -159,6 +160,12 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 			Tuple2.of(ReducingStateDescriptor.class, (StateFactory) RocksDBReducingState::create),
 			Tuple2.of(FoldingStateDescriptor.class, (StateFactory) RocksDBFoldingState::create)
 		).collect(Collectors.toMap(t -> t.f0, t -> t.f1));
+
+	private static final List<StateDescriptor.Type> supportedStateTypesForMerging = Arrays.asList(
+		StateDescriptor.Type.LIST,
+		StateDescriptor.Type.REDUCING,
+		StateDescriptor.Type.AGGREGATING
+	);
 
 	private interface StateFactory {
 		<K, N, SV, S extends State, IS extends S> IS createState(
@@ -677,9 +684,12 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 		/** Current data input view that wraps currentStateHandleInStream. */
 		private DataInputView currentStateHandleInView;
 		/** Current list of ColumnFamilyHandles for all column families we restore from currentKeyGroupsStateHandle. */
-		private List<ColumnFamilyHandle> currentStateHandleKVStateColumnFamilies;
+		private List<Tuple2<String, ColumnFamilyHandle>> currentStateHandleKVStateColumnFamilies;
 		/** The compression decorator that was used for writing the state, as determined by the meta data. */
 		private StreamCompressionDecorator keygroupStreamCompressionDecorator;
+
+		/** already seen states. **/
+		private Set<ColumnFamilyNameAndStateKey> alreadySeen = new HashSet<>();
 
 		/**
 		 * Creates a restore operation object for the given state backend instance.
@@ -784,7 +794,8 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 				} else {
 					// TODO with eager state registration in place, check here for serializer migration strategies
 				}
-				currentStateHandleKVStateColumnFamilies.add(registeredColumn.f0);
+				currentStateHandleKVStateColumnFamilies.add(
+					new Tuple2<>(restoredMetaInfo.getName(), registeredColumn.f0));
 			}
 		}
 
@@ -809,7 +820,8 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 							DataInputViewStreamWrapper compressedKgInputView = new DataInputViewStreamWrapper(compressedKgIn);
 							//TODO this could be aware of keyGroupPrefixBytes and write only one byte if possible
 							int kvStateId = compressedKgInputView.readShort();
-							ColumnFamilyHandle handle = currentStateHandleKVStateColumnFamilies.get(kvStateId);
+							ColumnFamilyHandle handle = currentStateHandleKVStateColumnFamilies.get(kvStateId).f1;
+							String cfName = currentStateHandleKVStateColumnFamilies.get(kvStateId).f0;
 							//insert all k/v pairs into DB
 							boolean keyGroupHasMoreKeys = true;
 							while (keyGroupHasMoreKeys) {
@@ -818,23 +830,85 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 								if (hasMetaDataFollowsFlag(key)) {
 									//clear the signal bit in the key to make it ready for insertion again
 									clearMetaDataFollowsFlag(key);
-									writeBatchWrapper.put(handle, key, value);
+
+									putOrMergeStates(writeBatchWrapper, handle, cfName, key, value);
+
 									//TODO this could be aware of keyGroupPrefixBytes and write only one byte if possible
 									kvStateId = END_OF_KEY_GROUP_MARK
 										& compressedKgInputView.readShort();
 									if (END_OF_KEY_GROUP_MARK == kvStateId) {
 										keyGroupHasMoreKeys = false;
 									} else {
-										handle = currentStateHandleKVStateColumnFamilies.get(kvStateId);
+										handle = currentStateHandleKVStateColumnFamilies.get(kvStateId).f1;
+										cfName = currentStateHandleKVStateColumnFamilies.get(kvStateId).f0;
 									}
 								} else {
-									writeBatchWrapper.put(handle, key, value);
+									putOrMergeStates(writeBatchWrapper, handle, cfName, key, value);
 								}
 							}
 						}
 					}
 				}
 			}
+		}
+
+		private void putOrMergeStates(RocksDBWriteBatchWrapper writeBatchWrapper,
+				ColumnFamilyHandle handle,
+				String cfName,
+				byte[] key,
+				byte[] value) throws RocksDBException {
+			ColumnFamilyNameAndStateKey cfk = new ColumnFamilyNameAndStateKey(cfName, key);
+			RegisteredStateMetaInfoBase stateMetaInfo =
+				rocksDBKeyedStateBackend.kvStateInformation.get(cfName).f1;
+			if (alreadySeen.contains(cfk) && stateMetaInfo instanceof RegisteredKeyValueStateBackendMetaInfo) {
+				StateDescriptor.Type stateType =
+					((RegisteredKeyValueStateBackendMetaInfo) stateMetaInfo).getStateType();
+				if (supportedStateTypesForMerging.contains(stateType)) {
+					writeBatchWrapper.merge(handle, key, value);
+				} else {
+					throw new IllegalStateException(
+						"Unexpected state type encountered when merging states from snapshot. " +
+						"stateName: " + cfName + ", stateType: " + stateType + ". " +
+						"Only " + supportedStateTypesForMerging + " are supported.");
+				}
+			} else {
+				writeBatchWrapper.put(handle, key, value);
+				alreadySeen.add(cfk);
+			}
+		}
+	}
+
+	/**
+	 * A simple wrapper class for comparing column family name and state key.
+	 */
+	private static class ColumnFamilyNameAndStateKey {
+		private final String columnFamilyName;
+		private final byte[] stateKey;
+
+		public ColumnFamilyNameAndStateKey(String columnFamilyName, byte[] stateKey) {
+			this.columnFamilyName = columnFamilyName;
+			this.stateKey = stateKey;
+		}
+
+		@Override
+		public boolean equals(Object o) {
+			if (this == o) {
+				return true;
+			}
+			if (o == null || getClass() != o.getClass()) {
+				return false;
+			}
+
+			ColumnFamilyNameAndStateKey that = (ColumnFamilyNameAndStateKey) o;
+			return columnFamilyName.equals(that.columnFamilyName)
+				&& Arrays.equals(stateKey, that.stateKey);
+		}
+
+		@Override
+		public int hashCode() {
+			int result = columnFamilyName.hashCode();
+			result = 31 * result + Arrays.hashCode(stateKey);
+			return result;
 		}
 	}
 
@@ -954,13 +1028,19 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 
 			this.restoredBackendUID = UUID.randomUUID();
 
-			initTargetDB(restoreStateHandles, stateBackend.keyGroupRange);
+			if (requireStateMerging(restoreStateHandles)) {
+				openEmptyDB();
+			} else {
+				initTargetDB(restoreStateHandles, stateBackend.keyGroupRange);
+			}
 
 			byte[] startKeyGroupPrefixBytes = new byte[stateBackend.keyGroupPrefixBytes];
 			RocksDBKeySerializationUtils.serializeKeyGroup(stateBackend.getKeyGroupRange().getStartKeyGroup(), startKeyGroupPrefixBytes);
 
 			byte[] stopKeyGroupPrefixBytes = new byte[stateBackend.keyGroupPrefixBytes];
 			RocksDBKeySerializationUtils.serializeKeyGroup(stateBackend.getKeyGroupRange().getEndKeyGroup() + 1, stopKeyGroupPrefixBytes);
+
+			Set<ColumnFamilyNameAndStateKey> alreadySeen = new HashSet<>();
 
 			for (KeyedStateHandle rawStateHandle : restoreStateHandles) {
 
@@ -984,8 +1064,9 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 						ColumnFamilyHandle tmpColumnFamilyHandle = tmpColumnFamilyHandles.get(i);
 						ColumnFamilyDescriptor tmpColumnFamilyDescriptor = tmpColumnFamilyDescriptors.get(i);
 
+						StateMetaInfoSnapshot stateMetaInfo = tmpRestoreDBInfo.stateMetaInfoSnapshots.get(i);
 						ColumnFamilyHandle targetColumnFamilyHandle = getOrRegisterColumnFamilyHandle(
-							tmpColumnFamilyDescriptor, null, tmpRestoreDBInfo.stateMetaInfoSnapshots.get(i));
+							tmpColumnFamilyDescriptor, null, stateMetaInfo);
 
 						try (RocksIteratorWrapper iterator = getRocksIterator(tmpRestoreDBInfo.db, tmpColumnFamilyHandle)) {
 
@@ -993,8 +1074,26 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 
 							while (iterator.isValid()) {
 
-								if (RocksDBIncrementalCheckpointUtils.beforeThePrefixBytes(iterator.key(), stopKeyGroupPrefixBytes)) {
-									writeBatchWrapper.put(targetColumnFamilyHandle, iterator.key(), iterator.value());
+								byte[] key = iterator.key();
+								if (RocksDBIncrementalCheckpointUtils.beforeThePrefixBytes(key, stopKeyGroupPrefixBytes)) {
+									String stateName = stateMetaInfo.getName();
+									ColumnFamilyNameAndStateKey cfk = new ColumnFamilyNameAndStateKey(stateName, key);
+									if (alreadySeen.contains(cfk) && StateMetaInfoSnapshot.BackendStateType.KEY_VALUE.equals(
+											stateMetaInfo.getBackendStateType())) {
+										StateDescriptor.Type stateType = StateDescriptor.Type.valueOf(
+											stateMetaInfo.getOption(StateMetaInfoSnapshot.CommonOptionsKeys.KEYED_STATE_TYPE));
+										if (supportedStateTypesForMerging.contains(stateType)) {
+											writeBatchWrapper.merge(targetColumnFamilyHandle, key, iterator.value());
+										} else {
+											throw new IllegalStateException(
+												"Unexpected state type encountered when merging states from snapshot. " +
+												"stateName: " + stateName + ", stateType: " + stateType + ". " +
+												"Only " + supportedStateTypesForMerging + " are supported.");
+										}
+									} else {
+										writeBatchWrapper.put(targetColumnFamilyHandle, key, iterator.value());
+										alreadySeen.add(cfk);
+									}
 								} else {
 									// Since the iterator will visit the record according to the sorted order,
 									// we can just break here.
@@ -1012,6 +1111,20 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 					}
 				}
 			}
+		}
+
+		private boolean requireStateMerging(Collection<KeyedStateHandle> restoreStateHandles) {
+			KeyedStateHandle[] stateHandles = restoreStateHandles.toArray(
+				new KeyedStateHandle[restoreStateHandles.size()]);
+			for (int i = 0; i < stateHandles.length; i++) {
+				for (int j = i + 1; j < stateHandles.length; j++) {
+					if (!KeyGroupRange.EMPTY_KEY_GROUP_RANGE.equals(
+							stateHandles[i].getKeyGroupRange().getIntersection(stateHandles[j].getKeyGroupRange()))) {
+						return true;
+					}
+				}
+			}
+			return false;
 		}
 
 		private class RestoredDBInstance implements AutoCloseable {
@@ -1156,15 +1269,19 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
 					throw e;
 				}
 			} else {
-				List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>(1);
-				stateBackend.db = stateBackend.openDB(
-					stateBackend.instanceRocksDBPath.getAbsolutePath(),
-					Collections.emptyList(),
-					columnFamilyHandles);
-				stateBackend.defaultColumnFamily = columnFamilyHandles.get(0);
-				stateBackend.writeBatchWrapper =
-					new RocksDBWriteBatchWrapper(stateBackend.db, stateBackend.writeOptions);
+				openEmptyDB();
 			}
+		}
+
+		private void openEmptyDB() throws IOException {
+			List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>(1);
+			stateBackend.db = stateBackend.openDB(
+				stateBackend.instanceRocksDBPath.getAbsolutePath(),
+				Collections.emptyList(),
+				columnFamilyHandles);
+			stateBackend.defaultColumnFamily = columnFamilyHandles.get(0);
+			stateBackend.writeBatchWrapper =
+				new RocksDBWriteBatchWrapper(stateBackend.db, stateBackend.writeOptions);
 		}
 
 		/**
