@@ -29,6 +29,8 @@ import org.apache.flink.table.api.scala._
 import org.apache.flink.table.api.{TableEnvironment, Types}
 import org.apache.flink.table.expressions.Null
 import org.apache.flink.table.runtime.utils.{StreamITCase, StreamTestData, StreamingWithStateTestBase}
+import org.apache.flink.table.sources.DimTableSource
+import org.apache.flink.table.utils.TestDimTableSourceProvider
 import org.apache.flink.types.Row
 import org.junit.Assert.assertEquals
 import org.junit._
@@ -1224,6 +1226,81 @@ class JoinITCase extends StreamingWithStateTestBase {
     env.execute()
     assertEquals(expected.sorted, StreamITCase.retractedResults.sorted)
   }
+
+  @Test
+  def testDimTableLeftJoin(): Unit = {
+    StreamITCase.clear
+    TestDimTableSourceProvider.clear()
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    val tEnv = TableEnvironment.getTableEnvironment(env)
+    env.setStateBackend(getStateBackend)
+    val ds1 = StreamTestData.getSmall3TupleDataStream(env).toTable(tEnv, 'a, 'b, 'c)
+    tEnv.registerTable("Table3", ds1)
+
+    val dimTableSource = new DimTableSource(
+      TestDimTableSourceProvider.tableType,
+      null,
+      TestDimTableSourceProvider.fieldNames,
+      TestDimTableSourceProvider.fieldTypes
+    )
+    tEnv.registerDimTableSource("DimTable", dimTableSource)
+
+    val sqlQuery = "SELECT a, c, e, f FROM Table3 LEFT JOIN DimTable ON b = d"
+    val resultTable = tEnv.sqlQuery(sqlQuery)
+    val resultDS = resultTable.toRetractStream[Row]
+    resultDS.addSink(new StreamITCase.RetractingSink)
+    env.execute()
+
+    assertEquals(TestDimTableSourceProvider.fieldNames.toList.sorted,
+      TestDimTableSourceProvider.requiredColumns.toList.sorted)
+
+    val expected = List(
+      "1,Hi,null,null",
+      "2,Hello,null,null",
+      "3,Hello world,null,null"
+    )
+    assertEquals(expected.sorted, StreamITCase.retractedResults.sorted)
+  }
+
+  @Test
+  def testDimTableInnerJoin(): Unit = {
+    StreamITCase.clear
+    TestDimTableSourceProvider.clear()
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    val tEnv = TableEnvironment.getTableEnvironment(env)
+    env.setStateBackend(getStateBackend)
+    val ds1 = StreamTestData.getSmall3TupleDataStream(env).toTable(tEnv, 'a, 'b, 'c)
+    tEnv.registerTable("Table3", ds1)
+
+    val params = new java.util.HashMap[String, java.io.Serializable]
+    params.put("HEY", "JUDE")
+    val dimTableSource = new DimTableSource(
+      TestDimTableSourceProvider.tableType,
+      params,
+      TestDimTableSourceProvider.fieldNames,
+      TestDimTableSourceProvider.fieldTypes
+    )
+    tEnv.registerDimTableSource("DimTable", dimTableSource)
+
+    val sqlQuery = "SELECT a, e FROM Table3 JOIN DimTable ON b = d"
+    val resultTable = tEnv.sqlQuery(sqlQuery)
+    val resultDS = resultTable.toAppendStream[Row]
+    resultDS.addSink(new StreamITCase.StringSink[Row])
+    env.execute()
+
+    assertEquals("JUDE", TestDimTableSourceProvider.params.get("HEY"))
+
+    assertEquals(Array("d", "e").toList.sorted,
+      TestDimTableSourceProvider.requiredColumns.toList.sorted)
+
+    val expected = List(
+      s"1,${TestDimTableSourceProvider.output.getField(1)}",
+      s"2,${TestDimTableSourceProvider.output.getField(1)}",
+      s"3,${TestDimTableSourceProvider.output.getField(1)}"
+    )
+    assertEquals(expected.sorted, StreamITCase.testResults.sorted)
+  }
+
 }
 
 private class Row4WatermarkExtractor

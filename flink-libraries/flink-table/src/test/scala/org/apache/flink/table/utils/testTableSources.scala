@@ -18,19 +18,23 @@
 
 package org.apache.flink.table.utils
 
+import java.io
+import java.lang.{Long => JLong}
 import java.util
 import java.util.{Collections, List => JList}
 
-import org.apache.flink.api.common.typeinfo.TypeInformation
+import org.apache.flink.api.common.typeinfo.{BasicTypeInfo, TypeInformation}
 import org.apache.flink.api.java.typeutils.RowTypeInfo
 import org.apache.flink.api.java.{DataSet, ExecutionEnvironment}
 import org.apache.flink.streaming.api.datastream.DataStream
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
 import org.apache.flink.table.api.TableSchema
+import org.apache.flink.table.expressions.Expression
 import org.apache.flink.table.runtime.utils.TimeTestUtil.EventTimeSourceFunction
 import org.apache.flink.table.sources._
 import org.apache.flink.table.sources.tsextractors.ExistingField
 import org.apache.flink.table.sources.wmstrategies.{AscendingTimestamps, PreserveWatermarks}
+import org.apache.flink.table.util.DimTableSourceProvider
 import org.apache.flink.types.Row
 
 import scala.collection.JavaConverters._
@@ -223,5 +227,51 @@ class TestPreserveWMTableSource[T](
   override def getReturnType: TypeInformation[T] = returnType
 
   override def getTableSchema: TableSchema = tableSchema
+
+}
+
+class TestDimTableSourceProvider extends DimTableSourceProvider {
+
+  override def typeName(): String = TestDimTableSourceProvider.tableType
+
+  override def init(params: util.Map[String, io.Serializable]): Unit = {
+    TestDimTableSourceProvider.params = params
+  }
+
+  override def scan(requiredColumns: Array[String],
+      filters: JList[Expression]): util.Iterator[Row] = {
+    TestDimTableSourceProvider.requiredColumns = requiredColumns
+    TestDimTableSourceProvider.filters.addAll(filters)
+    if (requiredColumns.length == 2
+        && requiredColumns.contains(TestDimTableSourceProvider.fieldNames(0))
+        && requiredColumns.contains(TestDimTableSourceProvider.fieldNames(1))) {
+      val result = new util.ArrayList[Row]()
+      result.add(TestDimTableSourceProvider.output)
+      result.iterator()
+    } else {
+      Collections.emptyIterator()
+    }
+  }
+
+}
+
+object TestDimTableSourceProvider {
+
+  val tableType: String = "test"
+  val fieldNames: Array[String] = Array("d", "e", "f")
+  val fieldTypes: Array[TypeInformation[_]] =
+    Array(BasicTypeInfo.LONG_TYPE_INFO, BasicTypeInfo.STRING_TYPE_INFO, BasicTypeInfo.INT_TYPE_INFO)
+
+  var params: util.Map[String, io.Serializable] = _
+  var requiredColumns: Array[String] = _
+  var filters: JList[Expression] = new util.ArrayList[Expression]()
+
+  val output: Row = Row.of(7L: JLong, "Hello World!")
+
+  def clear(): Unit = {
+    params = null
+    requiredColumns = null
+    filters = new util.ArrayList[Expression]()
+  }
 
 }

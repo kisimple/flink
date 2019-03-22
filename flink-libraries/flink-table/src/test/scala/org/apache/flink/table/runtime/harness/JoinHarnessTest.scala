@@ -18,22 +18,31 @@
 package org.apache.flink.table.runtime.harness
 
 import java.lang.{Integer => JInt, Long => JLong}
+import java.util.Collections
 import java.util.concurrent.ConcurrentLinkedQueue
 
+import org.apache.calcite.rel.core.JoinRelType
 import org.apache.flink.api.common.time.Time
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo._
 import org.apache.flink.api.common.typeinfo.{BasicTypeInfo, TypeInformation}
+import org.apache.flink.api.common.typeutils.base.{IntSerializer, LongSerializer, StringSerializer}
 import org.apache.flink.api.java.operators.join.JoinType
 import org.apache.flink.api.java.typeutils.RowTypeInfo
+import org.apache.flink.api.java.typeutils.runtime.RowSerializer
+import org.apache.flink.streaming.api.datastream.AsyncDataStream
+import org.apache.flink.streaming.api.operators.async.AsyncWaitOperator
 import org.apache.flink.streaming.api.operators.co.KeyedCoProcessOperator
 import org.apache.flink.streaming.api.watermark.Watermark
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord
-import org.apache.flink.streaming.util.KeyedTwoInputStreamOperatorTestHarness
-import org.apache.flink.table.api.{StreamQueryConfig, Types}
-import org.apache.flink.table.runtime.harness.HarnessTestBase.{RowResultSortComparator, RowResultSortComparatorWithWatermarks, TestStreamQueryConfig, TupleRowKeySelector}
+import org.apache.flink.streaming.util.{KeyedTwoInputStreamOperatorTestHarness, OneInputStreamOperatorTestHarness}
+import org.apache.flink.table.api.Types
+import org.apache.flink.table.expressions.{EqualTo, Expression, Literal, ResolvedFieldReference}
+import org.apache.flink.table.plan.util.DimTableJoinAsyncFunction
+import org.apache.flink.table.runtime.harness.HarnessTestBase.{TestStreamQueryConfig, TupleRowKeySelector}
 import org.apache.flink.table.runtime.join._
 import org.apache.flink.table.runtime.operators.KeyedCoProcessOperatorWithWatermarkDelay
-import org.apache.flink.table.runtime.types.{CRow, CRowTypeInfo}
+import org.apache.flink.table.runtime.types.{CRow, CRowSerializer, CRowTypeInfo}
+import org.apache.flink.table.utils.TestDimTableSourceProvider
 import org.apache.flink.types.Row
 import org.junit.Assert.{assertEquals, assertTrue}
 import org.junit.Test
@@ -1819,4 +1828,99 @@ class JoinHarnessTest extends HarnessTestBase {
     verify(expectedOutput, result)
     testHarness.close()
   }
+
+  @Test
+  def testDimTableInnerJoin(): Unit = {
+    testDimTableJoin(JoinRelType.INNER)
+  }
+
+  @Test
+  def testDimTableLeftJoin(): Unit = {
+    testDimTableJoin(JoinRelType.LEFT)
+  }
+
+  private def testDimTableJoin(joinType: JoinRelType): Unit = {
+    TestDimTableSourceProvider.clear()
+    val leftJoin = JoinRelType.LEFT.equals(joinType)
+    val leftKeys = Array(1)
+    val leftFieldTypes: Array[TypeInformation[_]] =
+      Array(BasicTypeInfo.LONG_TYPE_INFO, BasicTypeInfo.LONG_TYPE_INFO, BasicTypeInfo.INT_TYPE_INFO)
+    val rightKeys = Array(0)
+    val rightFieldTypes: Array[TypeInformation[_]] =
+      if (leftJoin) {
+        TestDimTableSourceProvider.fieldTypes
+      } else {
+        Array(TestDimTableSourceProvider.fieldTypes(0), TestDimTableSourceProvider.fieldTypes(1))
+      }
+    val rightFieldNames =
+      if (leftJoin) {
+        TestDimTableSourceProvider.fieldNames
+      } else {
+        Array(TestDimTableSourceProvider.fieldNames(0), TestDimTableSourceProvider.fieldNames(1))
+      }
+    val filters = Collections.emptyList[Expression]()
+    val func = new DimTableJoinAsyncFunction(joinType,
+      TestDimTableSourceProvider.tableType,
+      null,
+      TestDimTableSourceProvider.fieldNames,
+      TestDimTableSourceProvider.fieldTypes,
+      leftKeys, leftFieldTypes,
+      rightKeys, rightFieldTypes, rightFieldNames, filters)
+
+    val operator = new AsyncWaitOperator[CRow, CRow](
+      func, 60000, 10, AsyncDataStream.OutputMode.ORDERED)
+    val rowSerializer = new RowSerializer(Array(
+      LongSerializer.INSTANCE, LongSerializer.INSTANCE, IntSerializer.INSTANCE))
+    val testHarness = new OneInputStreamOperatorTestHarness[CRow, CRow](
+      operator, new CRowSerializer(rowSerializer))
+
+    testHarness.open()
+
+    assertEquals(2, TestDimTableSourceProvider.params.size())
+    assertEquals(TestDimTableSourceProvider.fieldNames,
+      TestDimTableSourceProvider.params.get("_fieldNames"))
+    assertEquals(TestDimTableSourceProvider.fieldTypes,
+      TestDimTableSourceProvider.params.get("_fieldTypes"))
+
+    val inputRow = Row.of(1L: JLong, 1000L: JLong, 10: JInt)
+    val inputRecord = new StreamRecord[CRow](new CRow(inputRow, true), 1)
+    testHarness.getCheckpointLock.synchronized {
+      testHarness.processElement(inputRecord)
+    }
+    testHarness.getCheckpointLock.synchronized {
+      testHarness.close()
+    }
+
+    assertEquals(rightFieldNames.toList.sorted,
+      TestDimTableSourceProvider.requiredColumns.toList.sorted)
+
+    val expectedFilters = new java.util.ArrayList[Expression]()
+    val attribute = ResolvedFieldReference(
+      rightFieldNames(rightKeys(0)), rightFieldTypes(rightKeys(0)))
+    val literal = new Literal(1000L, LONG_TYPE_INFO)
+    expectedFilters.add(EqualTo(attribute, literal))
+    assertEquals(expectedFilters, TestDimTableSourceProvider.filters)
+
+    val output = testHarness.getOutput.toArray
+    assertEquals(1, output.length)
+    if (leftJoin) {
+      assertEquals(
+        new StreamRecord[CRow](new CRow(Row.of(
+          inputRow.getField(0),
+          inputRow.getField(1),
+          inputRow.getField(2),
+          null, null, null), true), 1),
+        output(0))
+    } else {
+      assertEquals(
+        new StreamRecord[CRow](new CRow(Row.of(
+          inputRow.getField(0),
+          inputRow.getField(1),
+          inputRow.getField(2),
+          TestDimTableSourceProvider.output.getField(0),
+          TestDimTableSourceProvider.output.getField(1)), true), 1),
+        output(0))
+    }
+  }
+
 }
